@@ -23,11 +23,6 @@ import (
 	"github.com/go-logr/logr"
 )
 
-const (
-	ContainerdTaskDirName   = "io.containerd.runtime.v2.task"
-	ContainerdRootFsDirName = "rootfs"
-)
-
 // ContainerdBase containerd base struct
 type ContainerdBase struct {
 	containerdClient *containerd.Client

@@ -11,28 +11,27 @@
 package controllers
 
 import (
-	"os"
+	"testing"
+	"time"
 
-	v1 "k8s.io/cri-api/pkg/apis/runtime/v1"
-
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/config"
+	"github.com/stretchr/testify/assert"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
-func (s *BkLogSidecar) reloadBkunifylogbeat() error {
-	f, err := os.Create(config.WindowsReloadPath)
-	if err != nil {
-		return err
+func TestScheduleContainerRetryDeduplicatesAndPromotesNewContainer(t *testing.T) {
+	sidecar := &BkLogSidecar{
+		log:                    ctrl.Log.WithName("bkLogSidecar"),
+		containerRetryInterval: time.Hour,
 	}
-	defer f.Close()
+	sidecar.scheduleContainerRetry("container-1", false)
 
-	_, err = f.Write([]byte("signal"))
-	return err
-}
+	first := sidecar.pendingContainerRetry["container-1"]
+	sidecar.scheduleContainerRetry("container-1", true)
 
-func requiresContainerdPID() bool {
-	return false
-}
+	assert.Same(t, first, sidecar.pendingContainerRetry["container-1"])
+	assert.True(t, first.isNewContainer)
 
-func resolveContainerdV2Path(containerStatus *v1.ContainerStatusResponse, pid int) (string, string, error) {
-	return "", containerStatus.Status.LogPath, nil
+	sidecar.cancelContainerRetry("container-1")
+	_, exists := sidecar.pendingContainerRetry["container-1"]
+	assert.False(t, exists)
 }

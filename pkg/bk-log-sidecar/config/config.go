@@ -36,7 +36,7 @@ var (
 func FlagInit() {
 	flag.StringVar(&ContainerdNamespace, "containerd-namespace", "k8s.io", "namespace of containerd")
 	flag.StringVar(&ContainerdAddress, "containerd-address", "/run/containerd/containerd.sock", "address of containerd")
-	flag.StringVar(&ContainerdStatePath, "containerd-state-path", "/run/containerd", "state directory for containerd")
+	flag.StringVar(&ContainerdStatePath, "containerd-state-path", "/run/containerd", "deprecated: retained for compatibility and no longer used for container root paths")
 	flag.StringVar(&DockerSocket, "docker-socket", "unix:///var/run/docker.sock", "docker socket file")
 	flag.StringVar(&ContainerHostPath, "container-host-path", "/", "container host path")
 	flag.StringVar(&WindowsReloadPath, "windows-reload-path", "/windows-reload-path", "windows reload signal path")

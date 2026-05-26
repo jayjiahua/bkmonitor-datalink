@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"path/filepath"
 	"syscall"
 
 	v1 "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -63,13 +62,16 @@ func (s *BkLogSidecar) reloadBkunifylogbeat() error {
 	return nil
 }
 
-func resolveContainerdV2Path(containerStatus *v1.ContainerStatusResponse, pid int) (string, string, error) {
-	rootPath := fmt.Sprintf("/proc/%d/root", pid)
-	if pid == 0 {
-		rootPath = filepath.Join(config.ContainerdStatePath, ContainerdTaskDirName, config.ContainerdNamespace, containerStatus.Status.Id, ContainerdRootFsDirName)
-	}
+func requiresContainerdPID() bool {
+	return true
+}
 
+func resolveContainerdV2Path(containerStatus *v1.ContainerStatusResponse, pid int) (string, string, error) {
 	logPath := containerStatus.Status.LogPath
+	if pid <= 0 {
+		return "", logPath, errContainerPIDNotReady
+	}
+	rootPath := fmt.Sprintf("/proc/%d/root", pid)
 
 	// 如果logPath是软链，需要转换为真实路径
 	realLogPath, err := define.EvalSymlinks(logPath)

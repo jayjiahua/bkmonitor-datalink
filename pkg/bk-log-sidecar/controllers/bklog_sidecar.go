@@ -12,6 +12,7 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -49,14 +50,19 @@ type BkLogSidecar struct {
 	actualBkLogConfigCache sync.Map
 	log                    logr.Logger
 	stopCh                 chan struct{}
+	retryMu                sync.Mutex
+	pendingContainerRetry  map[string]*containerRetry
+	containerRetryInterval time.Duration
 }
 
 // NewBkLogSidecar new BkLogSidecar
 func NewBkLogSidecar(mgr ctrl.Manager) *BkLogSidecar {
 	bkLogSidecar := &BkLogSidecar{
-		stopCh:     make(chan struct{}),
-		log:        ctrl.Log.WithName("bkLogSidecar"),
-		kubeClient: mgr.GetCache(),
+		stopCh:                 make(chan struct{}),
+		log:                    ctrl.Log.WithName("bkLogSidecar"),
+		kubeClient:             mgr.GetCache(),
+		pendingContainerRetry:  make(map[string]*containerRetry),
+		containerRetryInterval: defaultContainerRetryInterval,
 	}
 	return bkLogSidecar
 }
@@ -73,6 +79,7 @@ func (s *BkLogSidecar) Start(_ context.Context) error {
 // Stop stop bklog sidecar
 func (s *BkLogSidecar) Stop() {
 	s.log.Info("stop bklog sidecar")
+	s.cancelAllContainerRetries()
 	close(s.stopCh)
 }
 
@@ -178,9 +185,12 @@ func (s *BkLogSidecar) allContainerBkLogConfigs(logConfigs []define.LogConfigTyp
 			logConfigs = s.containerBkLogConfigs(containerInfo, logConfigs, false)
 			continue
 		}
-		containerInfo := s.containerByID(container.ID)
-		if containerInfo == nil {
-			s.log.Error(fmt.Errorf("get container info %s failed", container.ID), "")
+		containerInfo, err := s.containerByID(container.ID)
+		if err != nil {
+			if errors.Is(err, errContainerPIDNotReady) {
+				s.scheduleContainerRetry(container.ID, false)
+			}
+			s.log.Error(err, fmt.Sprintf("get container info %s failed", container.ID))
 			continue
 		}
 		s.containerCache.Store(container.ID, containerInfo)
@@ -265,14 +275,24 @@ func (s *BkLogSidecar) eventHandler(event *define.ContainerEvent) {
 func (s *BkLogSidecar) startActionHandler(event *define.ContainerEvent) {
 	s.log.Info(fmt.Sprintf("start handler [%s] for container [%s]", event.Type, event.ContainerID))
 
-	container := s.getContainerInfoByID(event.ContainerID)
-	if container == nil {
+	container, err := s.getContainerInfoByID(event.ContainerID)
+	if err != nil {
+		if errors.Is(err, errContainerPIDNotReady) {
+			s.scheduleContainerRetry(event.ContainerID, true)
+			return
+		}
 		s.log.Info(fmt.Sprintf("container [%s] not exists, do nothing for action [%s].", event.ContainerID, event.Type))
 		return
 	}
 
+	s.applyContainerConfig(container, true)
+	s.log.Info(fmt.Sprintf("end handler [%s] for container [%s] done", event.Type, event.ContainerID))
+}
+
+func (s *BkLogSidecar) applyContainerConfig(container *define.Container, isNewContainer bool) {
+	s.containerCache.Store(container.ID, container)
 	var bkLogConfigs []define.LogConfigType
-	bkLogConfigs = s.containerBkLogConfigs(container, bkLogConfigs, true)
+	bkLogConfigs = s.containerBkLogConfigs(container, bkLogConfigs, isNewContainer)
 	if define.Empty(bkLogConfigs) {
 		s.log.Info(fmt.Sprintf("container [%s] not match log config", container.ID))
 		return
@@ -284,12 +304,12 @@ func (s *BkLogSidecar) startActionHandler(event *define.ContainerEvent) {
 	utils.CheckErrorFn(s.reloadBkunifylogbeat(), func(err error) {
 		s.log.Error(err, "handler event reload agent failed")
 	})
-	s.log.Info(fmt.Sprintf("end handler [%s] for container [%s] done", event.Type, event.ContainerID))
 }
 
 // destroyActionHandler handler destroy event
 func (s *BkLogSidecar) destroyActionHandler(event *define.ContainerEvent) {
 	s.log.Info(fmt.Sprintf("start handler [%s] for container [%s]", event.Type, event.ContainerID))
+	s.cancelContainerRetry(event.ContainerID)
 	go func(containerId string) {
 		containerInfo, ok := s.containerCache.Load(containerId)
 		if ok {
@@ -309,10 +329,11 @@ func (s *BkLogSidecar) destroyActionHandler(event *define.ContainerEvent) {
 // stopActionHandler handler stop event
 func (s *BkLogSidecar) stopActionHandler(event *define.ContainerEvent) {
 	s.log.Info(fmt.Sprintf("start handler [%s] for container [%s]", event.Type, event.ContainerID))
+	s.cancelContainerRetry(event.ContainerID)
 
 	go func(containerId string) {
-		container := s.getContainerInfoByID(containerId)
-		if container == nil {
+		container, err := s.getContainerInfoByID(containerId)
+		if err != nil {
 			s.log.Info(fmt.Sprintf("container [%s] not exists, do nothing for action [%s].", event.ContainerID, event.Type))
 			return
 		}

@@ -12,12 +12,18 @@ package controllers
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 
+	"github.com/containerd/containerd"
 	v1 "k8s.io/cri-api/pkg/apis/runtime/v1"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/define"
+)
+
+var (
+	errContainerPIDNotReady = errors.New("container pid is not ready")
+	errContainerNotRunning  = errors.New("container is not running")
 )
 
 // criClient wraps v1.RuntimeServiceClient for container listing and inspection.
@@ -51,7 +57,6 @@ func (c *criClient) ListContainers(ctx context.Context) ([]define.SimpleContaine
 func (c *criClient) ContainerStatus(ctx context.Context, containerID string) (*v1.ContainerStatusResponse, error) {
 	return c.client.ContainerStatus(ctx, &v1.ContainerStatusRequest{
 		ContainerId: containerID,
-		Verbose:     true,
 	})
 }
 
@@ -64,6 +69,41 @@ type ContainerdRuntime struct {
 
 func (r *ContainerdRuntime) Containers(ctx context.Context) ([]define.SimpleContainer, error) {
 	return r.cri.ListContainers(ctx)
+}
+
+func (r *ContainerdRuntime) containerPID(ctx context.Context, containerID string, status *v1.ContainerStatusResponse) (int, error) {
+	container, err := r.containerdClient.LoadContainer(ctx, containerID)
+	if err != nil {
+		if status.GetStatus().GetState() == v1.ContainerState_CONTAINER_EXITED {
+			return 0, fmt.Errorf("%w: container [%s] CRI state is exited", errContainerNotRunning, containerID)
+		}
+		return 0, fmt.Errorf("%w: load container [%s]: %v", errContainerPIDNotReady, containerID, err)
+	}
+
+	task, err := container.Task(ctx, nil)
+	if err != nil {
+		if status.GetStatus().GetState() == v1.ContainerState_CONTAINER_EXITED {
+			return 0, fmt.Errorf("%w: container [%s] CRI state is exited", errContainerNotRunning, containerID)
+		}
+		return 0, fmt.Errorf("%w: get task for container [%s]: %v", errContainerPIDNotReady, containerID, err)
+	}
+
+	taskStatus, err := task.Status(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("%w: get task status for container [%s]: %v", errContainerPIDNotReady, containerID, err)
+	}
+	if taskStatus.Status == containerd.Created {
+		return 0, fmt.Errorf("%w: container [%s] task state is [%s]", errContainerPIDNotReady, containerID, taskStatus.Status)
+	}
+	if taskStatus.Status != containerd.Running {
+		return 0, fmt.Errorf("%w: container [%s] task state is [%s]", errContainerNotRunning, containerID, taskStatus.Status)
+	}
+
+	pid := task.Pid()
+	if pid == 0 {
+		return 0, fmt.Errorf("%w: container [%s]", errContainerPIDNotReady, containerID)
+	}
+	return int(pid), nil
 }
 
 func (r *ContainerdRuntime) Inspect(ctx context.Context, containerID string) (define.Container, error) {
@@ -80,17 +120,15 @@ func (r *ContainerdRuntime) Inspect(ctx context.Context, containerID string) (de
 		})
 	}
 
-	// 方案一：优先用 PID 拼接容器文件系统的根路径
-	// 方案二：如果 PID 不存在，则使用 containerd 的 merged 路径
-	// 但是方案二存在一个问题，如果容器是在 sidecar 之后创建的，这个路径从容器内拿到的是空 (尽管宿主机上该目录确实存在)，原因待查
-	var containerInfo struct {
-		Pid int `json:"pid"`
+	pid := 0
+	if requiresContainerdPID() {
+		pid, err = r.containerPID(ctx, containerID, containerStatus)
+		if err != nil {
+			return define.Container{}, err
+		}
 	}
-	err = json.Unmarshal([]byte(containerStatus.Info["info"]), &containerInfo)
-	if err != nil {
-		r.log.Info(fmt.Sprintf("container [%s] info unmarshal error: %s", containerID, containerStatus.Info["info"]))
-	}
-	rootPath, logPath, err := resolveContainerdV2Path(containerStatus, containerInfo.Pid)
+
+	rootPath, logPath, err := resolveContainerdV2Path(containerStatus, pid)
 	if err != nil {
 		r.log.Error(err, fmt.Sprintf("container [%s] failed to eval symlink for log path [%s]", containerID, logPath))
 	}

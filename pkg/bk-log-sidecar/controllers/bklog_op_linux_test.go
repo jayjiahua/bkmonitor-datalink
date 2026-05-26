@@ -11,28 +11,20 @@
 package controllers
 
 import (
-	"os"
+	"errors"
+	"testing"
 
+	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/cri-api/pkg/apis/runtime/v1"
-
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/config"
 )
 
-func (s *BkLogSidecar) reloadBkunifylogbeat() error {
-	f, err := os.Create(config.WindowsReloadPath)
-	if err != nil {
-		return err
+func TestResolveContainerdV2PathDoesNotUseStatePathFallback(t *testing.T) {
+	status := &v1.ContainerStatusResponse{
+		Status: &v1.ContainerStatus{Id: "container-1"},
 	}
-	defer f.Close()
 
-	_, err = f.Write([]byte("signal"))
-	return err
-}
+	rootPath, _, err := resolveContainerdV2Path(status, 0)
 
-func requiresContainerdPID() bool {
-	return false
-}
-
-func resolveContainerdV2Path(containerStatus *v1.ContainerStatusResponse, pid int) (string, string, error) {
-	return "", containerStatus.Status.LogPath, nil
+	assert.Empty(t, rootPath)
+	assert.True(t, errors.Is(err, errContainerPIDNotReady))
 }
