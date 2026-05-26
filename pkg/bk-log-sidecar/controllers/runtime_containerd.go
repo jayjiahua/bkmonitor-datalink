@@ -16,6 +16,7 @@ import (
 	"fmt"
 
 	"github.com/containerd/containerd"
+	"github.com/containerd/errdefs"
 	v1 "k8s.io/cri-api/pkg/apis/runtime/v1"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/define"
@@ -71,32 +72,44 @@ func (r *ContainerdRuntime) Containers(ctx context.Context) ([]define.SimpleCont
 	return r.cri.ListContainers(ctx)
 }
 
+func pendingTaskError(err error, status *v1.ContainerStatusResponse, containerID, action string) error {
+	if status.GetStatus().GetState() == v1.ContainerState_CONTAINER_EXITED {
+		return fmt.Errorf("%w: container [%s] CRI state is exited", errContainerNotRunning, containerID)
+	}
+	if errdefs.IsNotFound(err) {
+		return fmt.Errorf("%w: %s for container [%s]: %v", errContainerPIDNotReady, action, containerID, err)
+	}
+	return err
+}
+
+func containerPIDStateError(status containerd.ProcessStatus, containerID string) error {
+	switch status {
+	case containerd.Created:
+		return fmt.Errorf("%w: container [%s] task state is [%s]", errContainerPIDNotReady, containerID, status)
+	case containerd.Running, containerd.Paused, containerd.Pausing:
+		return nil
+	default:
+		return fmt.Errorf("%w: container [%s] task state is [%s]", errContainerNotRunning, containerID, status)
+	}
+}
+
 func (r *ContainerdRuntime) containerPID(ctx context.Context, containerID string, status *v1.ContainerStatusResponse) (int, error) {
 	container, err := r.containerdClient.LoadContainer(ctx, containerID)
 	if err != nil {
-		if status.GetStatus().GetState() == v1.ContainerState_CONTAINER_EXITED {
-			return 0, fmt.Errorf("%w: container [%s] CRI state is exited", errContainerNotRunning, containerID)
-		}
-		return 0, fmt.Errorf("%w: load container [%s]: %v", errContainerPIDNotReady, containerID, err)
+		return 0, pendingTaskError(err, status, containerID, "load container")
 	}
 
 	task, err := container.Task(ctx, nil)
 	if err != nil {
-		if status.GetStatus().GetState() == v1.ContainerState_CONTAINER_EXITED {
-			return 0, fmt.Errorf("%w: container [%s] CRI state is exited", errContainerNotRunning, containerID)
-		}
-		return 0, fmt.Errorf("%w: get task for container [%s]: %v", errContainerPIDNotReady, containerID, err)
+		return 0, pendingTaskError(err, status, containerID, "get task")
 	}
 
 	taskStatus, err := task.Status(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("%w: get task status for container [%s]: %v", errContainerPIDNotReady, containerID, err)
+		return 0, pendingTaskError(err, status, containerID, "get task status")
 	}
-	if taskStatus.Status == containerd.Created {
-		return 0, fmt.Errorf("%w: container [%s] task state is [%s]", errContainerPIDNotReady, containerID, taskStatus.Status)
-	}
-	if taskStatus.Status != containerd.Running {
-		return 0, fmt.Errorf("%w: container [%s] task state is [%s]", errContainerNotRunning, containerID, taskStatus.Status)
+	if err := containerPIDStateError(taskStatus.Status, containerID); err != nil {
+		return 0, err
 	}
 
 	pid := task.Pid()
@@ -104,6 +117,23 @@ func (r *ContainerdRuntime) containerPID(ctx context.Context, containerID string
 		return 0, fmt.Errorf("%w: container [%s]", errContainerPIDNotReady, containerID)
 	}
 	return int(pid), nil
+}
+
+// ResolveRootPath returns the process-root path used only by container file collection.
+func (r *ContainerdRuntime) ResolveRootPath(ctx context.Context, containerID string) (string, error) {
+	if !requiresContainerdPID() {
+		return resolveContainerdRootPath(0)
+	}
+
+	containerStatus, err := r.cri.ContainerStatus(ctx, containerID)
+	if err != nil {
+		return "", err
+	}
+	pid, err := r.containerPID(ctx, containerID, containerStatus)
+	if err != nil {
+		return "", err
+	}
+	return resolveContainerdRootPath(pid)
 }
 
 func (r *ContainerdRuntime) Inspect(ctx context.Context, containerID string) (define.Container, error) {
@@ -120,17 +150,12 @@ func (r *ContainerdRuntime) Inspect(ctx context.Context, containerID string) (de
 		})
 	}
 
-	pid := 0
-	if requiresContainerdPID() {
-		pid, err = r.containerPID(ctx, containerID, containerStatus)
-		if err != nil {
-			return define.Container{}, err
-		}
-	}
-
-	rootPath, logPath, err := resolveContainerdV2Path(containerStatus, pid)
+	logPath := containerStatus.Status.LogPath
+	realLogPath, err := define.EvalSymlinks(logPath)
 	if err != nil {
 		r.log.Error(err, fmt.Sprintf("container [%s] failed to eval symlink for log path [%s]", containerID, logPath))
+	} else {
+		logPath = realLogPath
 	}
 
 	// 获取不到镜像名称时使用 Image ID
@@ -139,11 +164,10 @@ func (r *ContainerdRuntime) Inspect(ctx context.Context, containerID string) (de
 		image = containerStatus.Status.Image.Image
 	}
 	return define.Container{
-		ID:       containerStatus.Status.Id,
-		Labels:   containerStatus.Status.Labels,
-		Image:    image,
-		LogPath:  logPath,
-		RootPath: rootPath,
-		Mounts:   mounts,
+		ID:      containerStatus.Status.Id,
+		Labels:  containerStatus.Status.Labels,
+		Image:   image,
+		LogPath: logPath,
+		Mounts:  mounts,
 	}, nil
 }

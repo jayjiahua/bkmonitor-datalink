@@ -18,20 +18,20 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
-func TestScheduleContainerRetryDeduplicatesAndPromotesNewContainer(t *testing.T) {
+func TestScheduleRootPathRetryDeduplicatesAndPromotesNewContainer(t *testing.T) {
 	sidecar := &BkLogSidecar{
-		log:                    ctrl.Log.WithName("bkLogSidecar"),
-		containerRetryInterval: time.Hour,
+		log:                   ctrl.Log.WithName("bkLogSidecar"),
+		rootPathRetryInterval: time.Hour,
 	}
-	sidecar.scheduleContainerRetry("container-1", false)
+	sidecar.scheduleRootPathRetry("container-1", false)
 
-	first := sidecar.pendingContainerRetry["container-1"]
-	sidecar.scheduleContainerRetry("container-1", true)
+	first := sidecar.pendingRootPathRetry["container-1"]
+	sidecar.scheduleRootPathRetry("container-1", true)
 
-	assert.Same(t, first, sidecar.pendingContainerRetry["container-1"])
+	assert.Same(t, first, sidecar.pendingRootPathRetry["container-1"])
 	assert.True(t, first.isNewContainer)
 
-	sidecar.cancelContainerRetry("container-1")
-	_, exists := sidecar.pendingContainerRetry["container-1"]
+	sidecar.cancelRootPathRetry("container-1")
+	_, exists := sidecar.pendingRootPathRetry["container-1"]
 	assert.False(t, exists)
 }

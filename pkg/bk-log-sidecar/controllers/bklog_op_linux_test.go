@@ -15,16 +15,15 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	v1 "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
-func TestResolveContainerdV2PathDoesNotUseStatePathFallback(t *testing.T) {
-	status := &v1.ContainerStatusResponse{
-		Status: &v1.ContainerStatus{Id: "container-1"},
-	}
-
-	rootPath, _, err := resolveContainerdV2Path(status, 0)
+func TestResolveContainerdRootPathDoesNotUseStatePathFallback(t *testing.T) {
+	rootPath, err := resolveContainerdRootPath(0)
 
 	assert.Empty(t, rootPath)
 	assert.True(t, errors.Is(err, errContainerPIDNotReady))
+
+	rootPath, err = resolveContainerdRootPath(1234)
+	assert.NoError(t, err)
+	assert.Equal(t, "/proc/1234/root", rootPath)
 }

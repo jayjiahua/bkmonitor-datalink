@@ -13,8 +13,6 @@ package controllers
 import (
 	"os"
 
-	v1 "k8s.io/cri-api/pkg/apis/runtime/v1"
-
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/config"
 )
 
@@ -33,6 +31,6 @@ func requiresContainerdPID() bool {
 	return false
 }
 
-func resolveContainerdV2Path(containerStatus *v1.ContainerStatusResponse, pid int) (string, string, error) {
-	return "", containerStatus.Status.LogPath, nil
+func resolveContainerdRootPath(pid int) (string, error) {
+	return "", nil
 }

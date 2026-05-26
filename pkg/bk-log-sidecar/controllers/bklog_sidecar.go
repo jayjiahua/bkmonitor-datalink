@@ -22,10 +22,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/api/bk.tencent.com/v1alpha1"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/config"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/define"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/utils"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,6 +29,11 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/api/bk.tencent.com/v1alpha1"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/config"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/define"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/utils"
 )
 
 const SubscribeRetryInterval = 5 * time.Second
@@ -51,18 +52,18 @@ type BkLogSidecar struct {
 	log                    logr.Logger
 	stopCh                 chan struct{}
 	retryMu                sync.Mutex
-	pendingContainerRetry  map[string]*containerRetry
-	containerRetryInterval time.Duration
+	pendingRootPathRetry   map[string]*rootPathRetry
+	rootPathRetryInterval  time.Duration
 }
 
 // NewBkLogSidecar new BkLogSidecar
 func NewBkLogSidecar(mgr ctrl.Manager) *BkLogSidecar {
 	bkLogSidecar := &BkLogSidecar{
-		stopCh:                 make(chan struct{}),
-		log:                    ctrl.Log.WithName("bkLogSidecar"),
-		kubeClient:             mgr.GetCache(),
-		pendingContainerRetry:  make(map[string]*containerRetry),
-		containerRetryInterval: defaultContainerRetryInterval,
+		stopCh:                make(chan struct{}),
+		log:                   ctrl.Log.WithName("bkLogSidecar"),
+		kubeClient:            mgr.GetCache(),
+		pendingRootPathRetry:  make(map[string]*rootPathRetry),
+		rootPathRetryInterval: defaultRootPathRetryInterval,
 	}
 	return bkLogSidecar
 }
@@ -79,7 +80,7 @@ func (s *BkLogSidecar) Start(_ context.Context) error {
 // Stop stop bklog sidecar
 func (s *BkLogSidecar) Stop() {
 	s.log.Info("stop bklog sidecar")
-	s.cancelAllContainerRetries()
+	s.cancelAllRootPathRetries()
 	close(s.stopCh)
 }
 
@@ -182,31 +183,53 @@ func (s *BkLogSidecar) allContainerBkLogConfigs(logConfigs []define.LogConfigTyp
 		c, ok := s.containerCache.Load(container.ID)
 		if ok {
 			containerInfo := castContainer(c)
-			logConfigs = s.containerBkLogConfigs(containerInfo, logConfigs, false)
+			var pending bool
+			logConfigs, pending = s.containerBkLogConfigs(containerInfo, logConfigs, false)
+			if pending {
+				s.scheduleRootPathRetry(container.ID, false)
+			}
 			continue
 		}
-		containerInfo, err := s.containerByID(container.ID)
-		if err != nil {
-			if errors.Is(err, errContainerPIDNotReady) {
-				s.scheduleContainerRetry(container.ID, false)
-			}
-			s.log.Error(err, fmt.Sprintf("get container info %s failed", container.ID))
+		containerInfo := s.containerByID(container.ID)
+		if containerInfo == nil {
+			s.log.Error(fmt.Errorf("get container info %s failed", container.ID), "")
 			continue
 		}
 		s.containerCache.Store(container.ID, containerInfo)
-		logConfigs = s.containerBkLogConfigs(containerInfo, logConfigs, false)
+		var pending bool
+		logConfigs, pending = s.containerBkLogConfigs(containerInfo, logConfigs, false)
+		if pending {
+			s.scheduleRootPathRetry(container.ID, false)
+		}
 	}
 	return logConfigs
 }
 
 // containerBkLogConfigs will return single container all relation log config
-func (s *BkLogSidecar) containerBkLogConfigs(container *define.Container, logConfigs []define.LogConfigType, isNewContainer bool) []define.LogConfigType {
+func (s *BkLogSidecar) containerBkLogConfigs(container *define.Container, logConfigs []define.LogConfigType, isNewContainer bool) ([]define.LogConfigType, bool) {
+	pendingRootPath := false
+	var rootPathErr error
+	rootPathResolved := false
 	matchBklogConfigs, pod := s.matchBklogConfigs(container)
 	for _, bkLogConfig := range matchBklogConfigs {
 		// 对于新增容器的场景，需要从头开始采集日志文件
 		bkLogConfig.Spec.TailFiles = !isNewContainer // stdout and stderr collect log from beginning
 
 		if bkLogConfig.IsContainerType() {
+			if !rootPathResolved {
+				rootPathErr = s.resolveContainerRootPath(container)
+				rootPathResolved = true
+				if rootPathErr != nil && !errors.Is(rootPathErr, errContainerPIDNotReady) {
+					s.log.Error(rootPathErr, fmt.Sprintf("resolve root path for container [%s] failed", container.ID))
+				}
+			}
+			if errors.Is(rootPathErr, errContainerPIDNotReady) {
+				pendingRootPath = true
+				continue
+			}
+			if rootPathErr != nil {
+				continue
+			}
 			logConfigs = append(logConfigs, &define.ContainerLogConfig{
 				BkLogConfig: bkLogConfig,
 				Container:   container,
@@ -222,7 +245,7 @@ func (s *BkLogSidecar) containerBkLogConfigs(container *define.Container, logCon
 			RuntimeType: s.getRuntime().Type(),
 		})
 	}
-	return logConfigs
+	return logConfigs, pendingRootPath
 }
 
 // allContainers will all container info
@@ -275,12 +298,8 @@ func (s *BkLogSidecar) eventHandler(event *define.ContainerEvent) {
 func (s *BkLogSidecar) startActionHandler(event *define.ContainerEvent) {
 	s.log.Info(fmt.Sprintf("start handler [%s] for container [%s]", event.Type, event.ContainerID))
 
-	container, err := s.getContainerInfoByID(event.ContainerID)
-	if err != nil {
-		if errors.Is(err, errContainerPIDNotReady) {
-			s.scheduleContainerRetry(event.ContainerID, true)
-			return
-		}
+	container := s.getContainerInfoByID(event.ContainerID)
+	if container == nil {
 		s.log.Info(fmt.Sprintf("container [%s] not exists, do nothing for action [%s].", event.ContainerID, event.Type))
 		return
 	}
@@ -292,9 +311,14 @@ func (s *BkLogSidecar) startActionHandler(event *define.ContainerEvent) {
 func (s *BkLogSidecar) applyContainerConfig(container *define.Container, isNewContainer bool) {
 	s.containerCache.Store(container.ID, container)
 	var bkLogConfigs []define.LogConfigType
-	bkLogConfigs = s.containerBkLogConfigs(container, bkLogConfigs, isNewContainer)
+	bkLogConfigs, pendingRootPath := s.containerBkLogConfigs(container, bkLogConfigs, isNewContainer)
+	if pendingRootPath {
+		s.scheduleRootPathRetry(container.ID, isNewContainer)
+	}
 	if define.Empty(bkLogConfigs) {
-		s.log.Info(fmt.Sprintf("container [%s] not match log config", container.ID))
+		if !pendingRootPath {
+			s.log.Info(fmt.Sprintf("container [%s] not match log config", container.ID))
+		}
 		return
 	}
 	for _, logConfig := range bkLogConfigs {
@@ -309,7 +333,7 @@ func (s *BkLogSidecar) applyContainerConfig(container *define.Container, isNewCo
 // destroyActionHandler handler destroy event
 func (s *BkLogSidecar) destroyActionHandler(event *define.ContainerEvent) {
 	s.log.Info(fmt.Sprintf("start handler [%s] for container [%s]", event.Type, event.ContainerID))
-	s.cancelContainerRetry(event.ContainerID)
+	s.cancelRootPathRetry(event.ContainerID)
 	go func(containerId string) {
 		containerInfo, ok := s.containerCache.Load(containerId)
 		if ok {
@@ -329,11 +353,11 @@ func (s *BkLogSidecar) destroyActionHandler(event *define.ContainerEvent) {
 // stopActionHandler handler stop event
 func (s *BkLogSidecar) stopActionHandler(event *define.ContainerEvent) {
 	s.log.Info(fmt.Sprintf("start handler [%s] for container [%s]", event.Type, event.ContainerID))
-	s.cancelContainerRetry(event.ContainerID)
+	s.cancelRootPathRetry(event.ContainerID)
 
 	go func(containerId string) {
-		container, err := s.getContainerInfoByID(containerId)
-		if err != nil {
+		container := s.getContainerInfoByID(containerId)
+		if container == nil {
 			s.log.Info(fmt.Sprintf("container [%s] not exists, do nothing for action [%s].", event.ContainerID, event.Type))
 			return
 		}

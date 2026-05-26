@@ -16,10 +16,7 @@ import (
 	"os"
 	"syscall"
 
-	v1 "k8s.io/cri-api/pkg/apis/runtime/v1"
-
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/config"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/utils"
 )
 
@@ -66,17 +63,9 @@ func requiresContainerdPID() bool {
 	return true
 }
 
-func resolveContainerdV2Path(containerStatus *v1.ContainerStatusResponse, pid int) (string, string, error) {
-	logPath := containerStatus.Status.LogPath
+func resolveContainerdRootPath(pid int) (string, error) {
 	if pid <= 0 {
-		return "", logPath, errContainerPIDNotReady
+		return "", errContainerPIDNotReady
 	}
-	rootPath := fmt.Sprintf("/proc/%d/root", pid)
-
-	realLogPath, err := define.EvalSymlinks(logPath)
-	if err == nil {
-		logPath = realLogPath
-	}
-
-	return rootPath, logPath, err
+	return fmt.Sprintf("/proc/%d/root", pid), nil
 }
