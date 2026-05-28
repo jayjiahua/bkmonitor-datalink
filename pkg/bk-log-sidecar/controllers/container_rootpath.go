@@ -19,15 +19,10 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/define"
 )
 
-const defaultRootPathRetryInterval = 5 * time.Second
+const defaultRootPathCheckInterval = time.Minute
 
 type rootPathResolver interface {
 	ResolveRootPath(ctx context.Context, containerID string) (string, error)
-}
-
-type rootPathRetry struct {
-	cancel         context.CancelFunc
-	isNewContainer bool
 }
 
 func (s *BkLogSidecar) resolveContainerRootPath(container *define.Container) error {
@@ -47,101 +42,122 @@ func (s *BkLogSidecar) resolveContainerRootPath(container *define.Container) err
 	return nil
 }
 
-func (s *BkLogSidecar) scheduleRootPathRetry(containerID string, isNewContainer bool) {
-	s.retryMu.Lock()
-	if s.pendingRootPathRetry == nil {
-		s.pendingRootPathRetry = make(map[string]*rootPathRetry)
-	}
-	if retry, ok := s.pendingRootPathRetry[containerID]; ok {
-		if isNewContainer {
-			retry.isNewContainer = true
-		}
-		s.retryMu.Unlock()
-		return
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	retry := &rootPathRetry{cancel: cancel, isNewContainer: isNewContainer}
-	s.pendingRootPathRetry[containerID] = retry
-	s.retryMu.Unlock()
-
-	s.log.Info(fmt.Sprintf("container [%s] root path is not ready, retry every [%s]", containerID, s.rootPathRetryDuration()))
-	go s.retryRootPath(ctx, containerID, retry)
+func (s *BkLogSidecar) initRootPathCheck() {
+	go s.periodCheckRootPath()
 }
 
-func (s *BkLogSidecar) retryRootPath(ctx context.Context, containerID string, retry *rootPathRetry) {
-	ticker := time.NewTicker(s.rootPathRetryDuration())
-	defer ticker.Stop()
+func (s *BkLogSidecar) periodCheckRootPath() {
+	s.checkRootPath()
 
+	ticker := time.NewTicker(s.rootPathCheckDuration())
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			value, ok := s.containerCache.Load(containerID)
-			if !ok {
-				s.cancelRootPathRetry(containerID)
-				return
-			}
-			container := castContainer(value)
-			err := s.resolveContainerRootPath(container)
-			if errors.Is(err, errContainerPIDNotReady) {
-				continue
-			}
-			if err != nil {
-				s.log.Error(err, fmt.Sprintf("retry root path for container [%s] failed", containerID))
-				s.cancelRootPathRetry(containerID)
-				return
-			}
-
-			isNewContainer, ok := s.completeRootPathRetry(containerID, retry)
-			if !ok {
-				return
-			}
-			s.applyContainerConfig(container, isNewContainer)
-			return
-		case <-ctx.Done():
+			s.checkRootPath()
+		case <-s.stopCh:
+			s.log.Info("stop periodCheckRootPath")
 			return
 		}
 	}
 }
 
-func (s *BkLogSidecar) rootPathRetryDuration() time.Duration {
-	if s.rootPathRetryInterval > 0 {
-		return s.rootPathRetryInterval
+func (s *BkLogSidecar) checkRootPath() {
+	containers, err := s.allContainers()
+	if err != nil {
+		s.log.Error(err, "check root path list container failed")
+		return
 	}
-	return defaultRootPathRetryInterval
+
+	runningContainerIDs := make(map[string]struct{}, len(containers))
+	var bkLogConfigs []define.LogConfigType
+	for _, simpleContainer := range containers {
+		runningContainerIDs[simpleContainer.ID] = struct{}{}
+		container := s.getContainerInfoByID(simpleContainer.ID)
+		if container == nil || !s.hasMissingContainerRootPathConfig(container) {
+			continue
+		}
+		if err := s.resolveContainerRootPath(container); errors.Is(err, errContainerPIDNotReady) {
+			continue
+		} else if err != nil {
+			s.log.Error(err, fmt.Sprintf("check root path for container [%s] failed", simpleContainer.ID))
+			continue
+		}
+
+		isNewContainer := s.isPendingRootPathNewContainer(simpleContainer.ID)
+		s.clearPendingRootPathNewContainer(simpleContainer.ID)
+
+		var containerConfigs []define.LogConfigType
+		containerConfigs, _ = s.containerBkLogConfigs(container, containerConfigs, isNewContainer)
+		if define.Empty(containerConfigs) {
+			continue
+		}
+		bkLogConfigs = append(bkLogConfigs, containerConfigs...)
+	}
+	s.clearStoppedPendingRootPathNewContainers(runningContainerIDs)
+
+	if define.Empty(bkLogConfigs) {
+		return
+	}
+	for _, logConfig := range bkLogConfigs {
+		s.actualBkLogConfigCache.Store(logConfig.ConfigName(), logConfig)
+	}
+	s.writeConfig()
+	if err := s.reloadBkunifylogbeat(); err != nil {
+		s.log.Error(err, "check root path reload agent failed")
+	}
 }
 
-func (s *BkLogSidecar) completeRootPathRetry(containerID string, retry *rootPathRetry) (bool, bool) {
-	s.retryMu.Lock()
-	defer s.retryMu.Unlock()
-
-	current, ok := s.pendingRootPathRetry[containerID]
-	if !ok || current != retry {
-		return false, false
+func (s *BkLogSidecar) hasMissingContainerRootPathConfig(container *define.Container) bool {
+	if container.RootPath != "" {
+		return false
 	}
-	delete(s.pendingRootPathRetry, containerID)
-	return current.isNewContainer, true
+	matchBklogConfigs, pod := s.matchBklogConfigs(container)
+	for _, bkLogConfig := range matchBklogConfigs {
+		if !bkLogConfig.IsContainerType() {
+			continue
+		}
+		logConfig := &define.ContainerLogConfig{
+			BkLogConfig: bkLogConfig,
+			Container:   container,
+			Pod:         pod,
+		}
+		if _, ok := s.actualBkLogConfigCache.Load(logConfig.ConfigName()); !ok {
+			return true
+		}
+	}
+	return false
 }
 
-func (s *BkLogSidecar) cancelRootPathRetry(containerID string) {
-	s.retryMu.Lock()
-	retry, ok := s.pendingRootPathRetry[containerID]
-	if ok {
-		delete(s.pendingRootPathRetry, containerID)
+func (s *BkLogSidecar) rootPathCheckDuration() time.Duration {
+	if s.rootPathCheckInterval > 0 {
+		return s.rootPathCheckInterval
 	}
-	s.retryMu.Unlock()
-	if ok {
-		retry.cancel()
-	}
+	return defaultRootPathCheckInterval
 }
 
-func (s *BkLogSidecar) cancelAllRootPathRetries() {
-	s.retryMu.Lock()
-	retries := s.pendingRootPathRetry
-	s.pendingRootPathRetry = make(map[string]*rootPathRetry)
-	s.retryMu.Unlock()
+func (s *BkLogSidecar) markPendingRootPathNewContainer(containerID string) {
+	s.pendingRootPathNew.Store(containerID, true)
+}
 
-	for _, retry := range retries {
-		retry.cancel()
+func (s *BkLogSidecar) isPendingRootPathNewContainer(containerID string) bool {
+	isNew, ok := s.pendingRootPathNew.Load(containerID)
+	if !ok {
+		return false
 	}
+	return isNew.(bool)
+}
+
+func (s *BkLogSidecar) clearPendingRootPathNewContainer(containerID string) {
+	s.pendingRootPathNew.Delete(containerID)
+}
+
+func (s *BkLogSidecar) clearStoppedPendingRootPathNewContainers(runningContainerIDs map[string]struct{}) {
+	s.pendingRootPathNew.Range(func(key, _ interface{}) bool {
+		containerID := key.(string)
+		if _, ok := runningContainerIDs[containerID]; !ok {
+			s.pendingRootPathNew.Delete(containerID)
+		}
+		return true
+	})
 }

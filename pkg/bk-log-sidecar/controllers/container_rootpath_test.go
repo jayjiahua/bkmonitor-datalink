@@ -15,23 +15,31 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	ctrl "sigs.k8s.io/controller-runtime"
 )
 
-func TestScheduleRootPathRetryDeduplicatesAndPromotesNewContainer(t *testing.T) {
-	sidecar := &BkLogSidecar{
-		log:                   ctrl.Log.WithName("bkLogSidecar"),
-		rootPathRetryInterval: time.Hour,
+func TestRootPathCheckDuration(t *testing.T) {
+	sidecar := &BkLogSidecar{}
+	assert.Equal(t, time.Minute, sidecar.rootPathCheckDuration())
+
+	sidecar = &BkLogSidecar{
+		rootPathCheckInterval: time.Hour,
 	}
-	sidecar.scheduleRootPathRetry("container-1", false)
+	assert.Equal(t, time.Hour, sidecar.rootPathCheckDuration())
+}
 
-	first := sidecar.pendingRootPathRetry["container-1"]
-	sidecar.scheduleRootPathRetry("container-1", true)
+func TestPendingRootPathNewContainerMarker(t *testing.T) {
+	sidecar := &BkLogSidecar{}
 
-	assert.Same(t, first, sidecar.pendingRootPathRetry["container-1"])
-	assert.True(t, first.isNewContainer)
+	assert.False(t, sidecar.isPendingRootPathNewContainer("container-1"))
 
-	sidecar.cancelRootPathRetry("container-1")
-	_, exists := sidecar.pendingRootPathRetry["container-1"]
-	assert.False(t, exists)
+	sidecar.markPendingRootPathNewContainer("container-1")
+	assert.True(t, sidecar.isPendingRootPathNewContainer("container-1"))
+
+	sidecar.clearStoppedPendingRootPathNewContainers(map[string]struct{}{
+		"container-1": {},
+	})
+	assert.True(t, sidecar.isPendingRootPathNewContainer("container-1"))
+
+	sidecar.clearStoppedPendingRootPathNewContainers(map[string]struct{}{})
+	assert.False(t, sidecar.isPendingRootPathNewContainer("container-1"))
 }
