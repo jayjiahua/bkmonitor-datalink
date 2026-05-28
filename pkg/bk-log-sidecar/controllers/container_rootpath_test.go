@@ -12,6 +12,7 @@ package controllers
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,73 +31,55 @@ func TestRootPathRetryDuration(t *testing.T) {
 	assert.Equal(t, time.Hour, sidecar.rootPathRetryDuration())
 }
 
-func TestRequeuePendingRootPathEventsUsesRunningListOnce(t *testing.T) {
-	eventQueue := make(chan *containerEvent, 2)
+func TestScheduleRootPathRetryRequeuesRunningContainer(t *testing.T) {
+	eventQueue := make(chan *containerEvent, 1)
 	runtime := &rootPathRetryRuntime{
 		containers: []define.SimpleContainer{{ID: "running-container"}},
 	}
 	sidecar := &BkLogSidecar{
-		runtime:             runtime,
-		containerEventQueue: eventQueue,
+		runtime:               runtime,
+		containerEventQueue:   eventQueue,
+		rootPathRetryInterval: time.Millisecond,
 	}
 
-	sidecar.storePendingRootPathEvent(&containerEvent{
-		ContainerEvent: &define.ContainerEvent{
-			Type:        define.ContainerEventCreate,
-			ContainerID: "running-container",
-		},
-		isNewContainer: true,
-	})
-	sidecar.storePendingRootPathEvent(&containerEvent{
-		ContainerEvent: &define.ContainerEvent{
-			Type:        define.ContainerEventCreate,
-			ContainerID: "stopped-container",
-		},
-		isNewContainer: true,
-	})
+	sidecar.scheduleRootPathRetry(newContainerEvent("running-container", true))
 
-	sidecar.requeuePendingRootPathEvents()
-
-	assert.Equal(t, 1, runtime.containersCalls)
-	require.Len(t, eventQueue, 1)
-
-	event := <-eventQueue
-	assert.Equal(t, "running-container", event.ContainerID)
-	assert.True(t, event.isNewContainer)
-	assert.True(t, event.rootPathRetry)
-
-	_, ok := sidecar.pendingRootPathEvents.Load("running-container")
-	assert.True(t, ok)
-	_, ok = sidecar.pendingRootPathEvents.Load("stopped-container")
-	assert.False(t, ok)
+	select {
+	case event := <-eventQueue:
+		assert.Equal(t, "running-container", event.ContainerID)
+		assert.True(t, event.isNewContainer)
+	case <-time.After(time.Second):
+		require.Fail(t, "timed out waiting for root path retry event")
+	}
+	assert.Equal(t, int32(1), runtime.containersCalls.Load())
 }
 
-func TestRequeuePendingRootPathEventsSkipsRunningListWhenNoPending(t *testing.T) {
+func TestScheduleRootPathRetryDropsStoppedContainer(t *testing.T) {
+	eventQueue := make(chan *containerEvent, 1)
+	runtime := &rootPathRetryRuntime{}
 	sidecar := &BkLogSidecar{
-		runtime:             &rootPathRetryRuntime{},
-		containerEventQueue: make(chan *containerEvent, 1),
+		runtime:               runtime,
+		containerEventQueue:   eventQueue,
+		rootPathRetryInterval: time.Millisecond,
 	}
 
-	sidecar.requeuePendingRootPathEvents()
+	sidecar.scheduleRootPathRetry(newContainerEvent("stopped-container", true))
 
-	assert.Equal(t, 0, sidecar.runtime.(*rootPathRetryRuntime).containersCalls)
-}
-
-func TestRootPathRetryEventSkipsWhenPendingWasCleared(t *testing.T) {
-	sidecar := &BkLogSidecar{}
-
-	sidecar.startActionHandler(newContainerEvent("container-1", true, true))
-
-	assert.False(t, sidecar.hasPendingRootPathEvent("container-1"))
+	select {
+	case event := <-eventQueue:
+		require.Failf(t, "unexpected root path retry event", "event: %v", event)
+	case <-time.After(50 * time.Millisecond):
+	}
+	assert.Equal(t, int32(1), runtime.containersCalls.Load())
 }
 
 type rootPathRetryRuntime struct {
 	containers      []define.SimpleContainer
-	containersCalls int
+	containersCalls atomic.Int32
 }
 
 func (r *rootPathRetryRuntime) Containers(context.Context) ([]define.SimpleContainer, error) {
-	r.containersCalls++
+	r.containersCalls.Add(1)
 	return r.containers, nil
 }
 

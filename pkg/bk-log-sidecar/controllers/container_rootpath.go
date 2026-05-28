@@ -25,7 +25,6 @@ const (
 type containerEvent struct {
 	*define.ContainerEvent
 	isNewContainer bool
-	rootPathRetry  bool
 }
 
 type rootPathResolver interface {
@@ -49,14 +48,13 @@ func (s *BkLogSidecar) resolveContainerRootPath(container *define.Container) err
 	return nil
 }
 
-func newContainerEvent(containerID string, isNewContainer, rootPathRetry bool) *containerEvent {
+func newContainerEvent(containerID string, isNewContainer bool) *containerEvent {
 	return &containerEvent{
 		ContainerEvent: &define.ContainerEvent{
 			Type:        define.ContainerEventCreate,
 			ContainerID: containerID,
 		},
 		isNewContainer: isNewContainer,
-		rootPathRetry:  rootPathRetry,
 	}
 }
 
@@ -79,79 +77,45 @@ func (s *BkLogSidecar) enqueueContainerEvent(event *containerEvent) {
 	s.containerEventQueue <- event
 }
 
-func (s *BkLogSidecar) periodRetryRootPathEvents() {
-	ticker := time.NewTicker(s.rootPathRetryDuration())
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			s.requeuePendingRootPathEvents()
-		case <-s.stopCh:
-			s.log.Info("stop periodRetryRootPathEvents")
-			return
-		}
-	}
-}
-
-func (s *BkLogSidecar) requeuePendingRootPathEvents() {
-	if !s.hasPendingRootPathEvents() {
-		return
-	}
-
-	containers, err := s.allContainers()
-	if err != nil {
-		s.log.Error(err, "list containers before root path retry failed")
-		return
-	}
-
-	runningContainerIDs := make(map[string]struct{}, len(containers))
-	for _, simpleContainer := range containers {
-		runningContainerIDs[simpleContainer.ID] = struct{}{}
-	}
-
-	s.pendingRootPathEvents.Range(func(key, value interface{}) bool {
-		containerID := key.(string)
-		if _, ok := runningContainerIDs[containerID]; !ok {
-			s.pendingRootPathEvents.Delete(containerID)
-			return true
-		}
-
-		event, ok := value.(*containerEvent)
-		if !ok || event == nil || event.ContainerEvent == nil {
-			s.pendingRootPathEvents.Delete(containerID)
-			return true
-		}
-		s.enqueueContainerEvent(newContainerEvent(event.ContainerID, event.isNewContainer, true))
-		return true
-	})
-}
-
-func (s *BkLogSidecar) storePendingRootPathEvent(event *containerEvent) {
+func (s *BkLogSidecar) scheduleRootPathRetry(event *containerEvent) {
 	if event == nil || event.ContainerEvent == nil {
 		return
 	}
 	if event.Type != define.ContainerEventCreate {
 		return
 	}
-	s.pendingRootPathEvents.Store(event.ContainerID, newContainerEvent(event.ContainerID, event.isNewContainer, false))
+
+	go func() {
+		timer := time.NewTimer(s.rootPathRetryDuration())
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			running, err := s.containerRunning(event.ContainerID)
+			if err != nil {
+				s.log.Error(err, "list containers before root path retry failed")
+				s.scheduleRootPathRetry(event)
+				return
+			}
+			if running {
+				s.enqueueContainerEvent(newContainerEvent(event.ContainerID, event.isNewContainer))
+			}
+		case <-s.stopCh:
+			return
+		}
+	}()
 }
 
-func (s *BkLogSidecar) hasPendingRootPathEvent(containerID string) bool {
-	_, ok := s.pendingRootPathEvents.Load(containerID)
-	return ok
-}
-
-func (s *BkLogSidecar) hasPendingRootPathEvents() bool {
-	hasPending := false
-	s.pendingRootPathEvents.Range(func(_, _ interface{}) bool {
-		hasPending = true
-		return false
-	})
-	return hasPending
-}
-
-func (s *BkLogSidecar) clearPendingRootPathEvent(containerID string) {
-	s.pendingRootPathEvents.Delete(containerID)
+func (s *BkLogSidecar) containerRunning(containerID string) (bool, error) {
+	containers, err := s.allContainers()
+	if err != nil {
+		return false, err
+	}
+	for _, container := range containers {
+		if container.ID == containerID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *BkLogSidecar) rootPathRetryDuration() time.Duration {

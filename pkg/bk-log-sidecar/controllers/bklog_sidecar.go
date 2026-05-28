@@ -52,7 +52,6 @@ type BkLogSidecar struct {
 	log                    logr.Logger
 	stopCh                 chan struct{}
 	containerEventQueue    chan *containerEvent
-	pendingRootPathEvents  sync.Map
 	rootPathRetryInterval  time.Duration
 }
 
@@ -117,7 +116,6 @@ func (s *BkLogSidecar) initContainerCache() {
 // initEventHandler init event handler
 func (s *BkLogSidecar) initEventHandler() {
 	go s.dispatchContainerEvents()
-	go s.periodRetryRootPathEvents()
 	go s.subscribeEvent()
 }
 
@@ -184,7 +182,7 @@ func (s *BkLogSidecar) allContainerBkLogConfigs(logConfigs []define.LogConfigTyp
 		c, ok := s.containerCache.Load(container.ID)
 		if ok {
 			containerInfo := castContainer(c)
-			logConfigs = s.containerBkLogConfigsWithPendingEvent(containerInfo, logConfigs, false)
+			logConfigs = s.containerBkLogConfigsWithRootPathRetry(containerInfo, logConfigs, false)
 			continue
 		}
 		containerInfo := s.containerByID(container.ID)
@@ -193,17 +191,17 @@ func (s *BkLogSidecar) allContainerBkLogConfigs(logConfigs []define.LogConfigTyp
 			continue
 		}
 		s.containerCache.Store(container.ID, containerInfo)
-		logConfigs = s.containerBkLogConfigsWithPendingEvent(containerInfo, logConfigs, false)
+		logConfigs = s.containerBkLogConfigsWithRootPathRetry(containerInfo, logConfigs, false)
 	}
 	return logConfigs
 }
 
-func (s *BkLogSidecar) containerBkLogConfigsWithPendingEvent(
+func (s *BkLogSidecar) containerBkLogConfigsWithRootPathRetry(
 	container *define.Container, logConfigs []define.LogConfigType, isNewContainer bool,
 ) []define.LogConfigType {
 	logConfigs, pendingRootPath := s.containerBkLogConfigs(container, logConfigs, isNewContainer)
 	if pendingRootPath {
-		s.storePendingRootPathEvent(newContainerEvent(container.ID, isNewContainer, false))
+		s.scheduleRootPathRetry(newContainerEvent(container.ID, isNewContainer))
 	}
 	return logConfigs
 }
@@ -307,11 +305,6 @@ func (s *BkLogSidecar) eventHandler(event *containerEvent) {
 func (s *BkLogSidecar) startActionHandler(event *containerEvent) {
 	s.log.Info(fmt.Sprintf("start handler [%s] for container [%s]", event.Type, event.ContainerID))
 
-	if event.rootPathRetry && !s.hasPendingRootPathEvent(event.ContainerID) {
-		s.log.Info(fmt.Sprintf("skip stale root path retry event for container [%s]", event.ContainerID))
-		return
-	}
-
 	container := s.getContainerInfoByID(event.ContainerID)
 	if container == nil {
 		s.log.Info(fmt.Sprintf("container [%s] not exists, do nothing for action [%s].", event.ContainerID, event.Type))
@@ -319,9 +312,7 @@ func (s *BkLogSidecar) startActionHandler(event *containerEvent) {
 	}
 
 	if s.applyContainerConfig(container, event.isNewContainer) {
-		s.storePendingRootPathEvent(event)
-	} else {
-		s.clearPendingRootPathEvent(event.ContainerID)
+		s.scheduleRootPathRetry(event)
 	}
 	s.log.Info(fmt.Sprintf("end handler [%s] for container [%s] done", event.Type, event.ContainerID))
 }
@@ -359,7 +350,6 @@ func (s *BkLogSidecar) storeActualBkLogConfigs(logConfigs []define.LogConfigType
 // destroyActionHandler handler destroy event
 func (s *BkLogSidecar) destroyActionHandler(event *containerEvent) {
 	s.log.Info(fmt.Sprintf("start handler [%s] for container [%s]", event.Type, event.ContainerID))
-	s.clearPendingRootPathEvent(event.ContainerID)
 	go func(containerId string) {
 		containerInfo, ok := s.containerCache.Load(containerId)
 		if ok {
@@ -379,7 +369,6 @@ func (s *BkLogSidecar) destroyActionHandler(event *containerEvent) {
 // stopActionHandler handler stop event
 func (s *BkLogSidecar) stopActionHandler(event *containerEvent) {
 	s.log.Info(fmt.Sprintf("start handler [%s] for container [%s]", event.Type, event.ContainerID))
-	s.clearPendingRootPathEvent(event.ContainerID)
 
 	go func(containerId string) {
 		container := s.getContainerInfoByID(containerId)
