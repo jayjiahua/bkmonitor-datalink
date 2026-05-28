@@ -51,8 +51,9 @@ type BkLogSidecar struct {
 	actualBkLogConfigCache sync.Map
 	log                    logr.Logger
 	stopCh                 chan struct{}
-	pendingRootPathNew     sync.Map
-	rootPathCheckInterval  time.Duration
+	containerEventQueue    chan *containerEvent
+	pendingRootPathEvents  sync.Map
+	rootPathRetryInterval  time.Duration
 }
 
 // NewBkLogSidecar new BkLogSidecar
@@ -61,7 +62,8 @@ func NewBkLogSidecar(mgr ctrl.Manager) *BkLogSidecar {
 		stopCh:                make(chan struct{}),
 		log:                   ctrl.Log.WithName("bkLogSidecar"),
 		kubeClient:            mgr.GetCache(),
-		rootPathCheckInterval: defaultRootPathCheckInterval,
+		containerEventQueue:   make(chan *containerEvent, defaultContainerEventQueueSize),
+		rootPathRetryInterval: defaultRootPathRetryInterval,
 	}
 	return bkLogSidecar
 }
@@ -72,7 +74,6 @@ func (s *BkLogSidecar) Start(_ context.Context) error {
 	s.initContainerCache()
 	s.initEventHandler()
 	s.generateActualBkLogConfig()
-	s.initRootPathCheck()
 	return nil
 }
 
@@ -115,6 +116,8 @@ func (s *BkLogSidecar) initContainerCache() {
 
 // initEventHandler init event handler
 func (s *BkLogSidecar) initEventHandler() {
+	go s.dispatchContainerEvents()
+	go s.periodRetryRootPathEvents()
 	go s.subscribeEvent()
 }
 
@@ -181,7 +184,7 @@ func (s *BkLogSidecar) allContainerBkLogConfigs(logConfigs []define.LogConfigTyp
 		c, ok := s.containerCache.Load(container.ID)
 		if ok {
 			containerInfo := castContainer(c)
-			logConfigs, _ = s.containerBkLogConfigs(containerInfo, logConfigs, false)
+			logConfigs = s.containerBkLogConfigsWithPendingEvent(containerInfo, logConfigs, false)
 			continue
 		}
 		containerInfo := s.containerByID(container.ID)
@@ -190,7 +193,17 @@ func (s *BkLogSidecar) allContainerBkLogConfigs(logConfigs []define.LogConfigTyp
 			continue
 		}
 		s.containerCache.Store(container.ID, containerInfo)
-		logConfigs, _ = s.containerBkLogConfigs(containerInfo, logConfigs, false)
+		logConfigs = s.containerBkLogConfigsWithPendingEvent(containerInfo, logConfigs, false)
+	}
+	return logConfigs
+}
+
+func (s *BkLogSidecar) containerBkLogConfigsWithPendingEvent(
+	container *define.Container, logConfigs []define.LogConfigType, isNewContainer bool,
+) []define.LogConfigType {
+	logConfigs, pendingRootPath := s.containerBkLogConfigs(container, logConfigs, isNewContainer)
+	if pendingRootPath {
+		s.storePendingRootPathEvent(newContainerEvent(container.ID, isNewContainer, false))
 	}
 	return logConfigs
 }
@@ -254,7 +267,10 @@ func (s *BkLogSidecar) subscribeEvent() {
 		for {
 			select {
 			case event := <-events:
-				s.eventHandler(event)
+				s.enqueueContainerEvent(&containerEvent{
+					ContainerEvent: event,
+					isNewContainer: true,
+				})
 			case err := <-errs:
 				s.log.Info(fmt.Sprintf("runtime subscribe got error: %s, will retry in %s", err, SubscribeRetryInterval.String()))
 				cancel()
@@ -269,7 +285,10 @@ func (s *BkLogSidecar) subscribeEvent() {
 }
 
 // eventHandler handler event
-func (s *BkLogSidecar) eventHandler(event *define.ContainerEvent) {
+func (s *BkLogSidecar) eventHandler(event *containerEvent) {
+	if event == nil || event.ContainerEvent == nil {
+		return
+	}
 	switch event.Type {
 	case define.ContainerEventCreate:
 		s.startActionHandler(event)
@@ -285,8 +304,13 @@ func (s *BkLogSidecar) eventHandler(event *define.ContainerEvent) {
 }
 
 // startActionHandler handler start event
-func (s *BkLogSidecar) startActionHandler(event *define.ContainerEvent) {
+func (s *BkLogSidecar) startActionHandler(event *containerEvent) {
 	s.log.Info(fmt.Sprintf("start handler [%s] for container [%s]", event.Type, event.ContainerID))
+
+	if event.rootPathRetry && !s.hasPendingRootPathEvent(event.ContainerID) {
+		s.log.Info(fmt.Sprintf("skip stale root path retry event for container [%s]", event.ContainerID))
+		return
+	}
 
 	container := s.getContainerInfoByID(event.ContainerID)
 	if container == nil {
@@ -294,35 +318,48 @@ func (s *BkLogSidecar) startActionHandler(event *define.ContainerEvent) {
 		return
 	}
 
-	s.applyContainerConfig(container, true)
+	if s.applyContainerConfig(container, event.isNewContainer) {
+		s.storePendingRootPathEvent(event)
+	} else {
+		s.clearPendingRootPathEvent(event.ContainerID)
+	}
 	s.log.Info(fmt.Sprintf("end handler [%s] for container [%s] done", event.Type, event.ContainerID))
 }
 
-func (s *BkLogSidecar) applyContainerConfig(container *define.Container, isNewContainer bool) {
+func (s *BkLogSidecar) applyContainerConfig(container *define.Container, isNewContainer bool) bool {
 	s.containerCache.Store(container.ID, container)
 	var bkLogConfigs []define.LogConfigType
 	bkLogConfigs, pendingRootPath := s.containerBkLogConfigs(container, bkLogConfigs, isNewContainer)
-	if pendingRootPath && isNewContainer {
-		s.markPendingRootPathNewContainer(container.ID)
-	}
 	if define.Empty(bkLogConfigs) {
 		if !pendingRootPath {
 			s.log.Info(fmt.Sprintf("container [%s] not match log config", container.ID))
 		}
-		return
+		return pendingRootPath
 	}
-	for _, logConfig := range bkLogConfigs {
+	if s.storeActualBkLogConfigs(bkLogConfigs) {
+		s.writeConfig()
+		utils.CheckErrorFn(s.reloadBkunifylogbeat(), func(err error) {
+			s.log.Error(err, "handler event reload agent failed")
+		})
+	}
+	return pendingRootPath
+}
+
+func (s *BkLogSidecar) storeActualBkLogConfigs(logConfigs []define.LogConfigType) bool {
+	changed := false
+	for _, logConfig := range logConfigs {
+		if _, ok := s.actualBkLogConfigCache.Load(logConfig.ConfigName()); !ok {
+			changed = true
+		}
 		s.actualBkLogConfigCache.Store(logConfig.ConfigName(), logConfig)
 	}
-	s.writeConfig()
-	utils.CheckErrorFn(s.reloadBkunifylogbeat(), func(err error) {
-		s.log.Error(err, "handler event reload agent failed")
-	})
+	return changed
 }
 
 // destroyActionHandler handler destroy event
-func (s *BkLogSidecar) destroyActionHandler(event *define.ContainerEvent) {
+func (s *BkLogSidecar) destroyActionHandler(event *containerEvent) {
 	s.log.Info(fmt.Sprintf("start handler [%s] for container [%s]", event.Type, event.ContainerID))
+	s.clearPendingRootPathEvent(event.ContainerID)
 	go func(containerId string) {
 		containerInfo, ok := s.containerCache.Load(containerId)
 		if ok {
@@ -340,8 +377,9 @@ func (s *BkLogSidecar) destroyActionHandler(event *define.ContainerEvent) {
 }
 
 // stopActionHandler handler stop event
-func (s *BkLogSidecar) stopActionHandler(event *define.ContainerEvent) {
+func (s *BkLogSidecar) stopActionHandler(event *containerEvent) {
 	s.log.Info(fmt.Sprintf("start handler [%s] for container [%s]", event.Type, event.ContainerID))
+	s.clearPendingRootPathEvent(event.ContainerID)
 
 	go func(containerId string) {
 		container := s.getContainerInfoByID(containerId)

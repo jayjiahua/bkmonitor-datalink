@@ -11,35 +11,103 @@
 package controllers
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-log-sidecar/define"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestRootPathCheckDuration(t *testing.T) {
+func TestRootPathRetryDuration(t *testing.T) {
 	sidecar := &BkLogSidecar{}
-	assert.Equal(t, time.Minute, sidecar.rootPathCheckDuration())
+	assert.Equal(t, time.Minute, sidecar.rootPathRetryDuration())
 
 	sidecar = &BkLogSidecar{
-		rootPathCheckInterval: time.Hour,
+		rootPathRetryInterval: time.Hour,
 	}
-	assert.Equal(t, time.Hour, sidecar.rootPathCheckDuration())
+	assert.Equal(t, time.Hour, sidecar.rootPathRetryDuration())
 }
 
-func TestPendingRootPathNewContainerMarker(t *testing.T) {
+func TestRequeuePendingRootPathEventsUsesRunningListOnce(t *testing.T) {
+	eventQueue := make(chan *containerEvent, 2)
+	runtime := &rootPathRetryRuntime{
+		containers: []define.SimpleContainer{{ID: "running-container"}},
+	}
+	sidecar := &BkLogSidecar{
+		runtime:             runtime,
+		containerEventQueue: eventQueue,
+	}
+
+	sidecar.storePendingRootPathEvent(&containerEvent{
+		ContainerEvent: &define.ContainerEvent{
+			Type:        define.ContainerEventCreate,
+			ContainerID: "running-container",
+		},
+		isNewContainer: true,
+	})
+	sidecar.storePendingRootPathEvent(&containerEvent{
+		ContainerEvent: &define.ContainerEvent{
+			Type:        define.ContainerEventCreate,
+			ContainerID: "stopped-container",
+		},
+		isNewContainer: true,
+	})
+
+	sidecar.requeuePendingRootPathEvents()
+
+	assert.Equal(t, 1, runtime.containersCalls)
+	require.Len(t, eventQueue, 1)
+
+	event := <-eventQueue
+	assert.Equal(t, "running-container", event.ContainerID)
+	assert.True(t, event.isNewContainer)
+	assert.True(t, event.rootPathRetry)
+
+	_, ok := sidecar.pendingRootPathEvents.Load("running-container")
+	assert.True(t, ok)
+	_, ok = sidecar.pendingRootPathEvents.Load("stopped-container")
+	assert.False(t, ok)
+}
+
+func TestRequeuePendingRootPathEventsSkipsRunningListWhenNoPending(t *testing.T) {
+	sidecar := &BkLogSidecar{
+		runtime:             &rootPathRetryRuntime{},
+		containerEventQueue: make(chan *containerEvent, 1),
+	}
+
+	sidecar.requeuePendingRootPathEvents()
+
+	assert.Equal(t, 0, sidecar.runtime.(*rootPathRetryRuntime).containersCalls)
+}
+
+func TestRootPathRetryEventSkipsWhenPendingWasCleared(t *testing.T) {
 	sidecar := &BkLogSidecar{}
 
-	assert.False(t, sidecar.isPendingRootPathNewContainer("container-1"))
+	sidecar.startActionHandler(newContainerEvent("container-1", true, true))
 
-	sidecar.markPendingRootPathNewContainer("container-1")
-	assert.True(t, sidecar.isPendingRootPathNewContainer("container-1"))
+	assert.False(t, sidecar.hasPendingRootPathEvent("container-1"))
+}
 
-	sidecar.clearStoppedPendingRootPathNewContainers(map[string]struct{}{
-		"container-1": {},
-	})
-	assert.True(t, sidecar.isPendingRootPathNewContainer("container-1"))
+type rootPathRetryRuntime struct {
+	containers      []define.SimpleContainer
+	containersCalls int
+}
 
-	sidecar.clearStoppedPendingRootPathNewContainers(map[string]struct{}{})
-	assert.False(t, sidecar.isPendingRootPathNewContainer("container-1"))
+func (r *rootPathRetryRuntime) Containers(context.Context) ([]define.SimpleContainer, error) {
+	r.containersCalls++
+	return r.containers, nil
+}
+
+func (r *rootPathRetryRuntime) Inspect(context.Context, string) (define.Container, error) {
+	return define.Container{}, nil
+}
+
+func (r *rootPathRetryRuntime) Subscribe(context.Context) (<-chan *define.ContainerEvent, <-chan error) {
+	return nil, nil
+}
+
+func (r *rootPathRetryRuntime) Type() define.RuntimeType {
+	return define.RuntimeTypeContainerd
 }
